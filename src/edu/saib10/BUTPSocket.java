@@ -33,7 +33,7 @@ public class BUTPSocket {
     private DatagramSocket socket;
     private DatagramPacket send_packet, recv_packet;
     private byte[] recv, send, BUTPSegment;
-    private int cwnd = 0, rwnd = 0, sequence, acknowledge;
+    private int cwnd = 0, rwnd = 0, sequence, acknowledge,seq_ack,seq_tr,seq_rec;
     private short checksum;
     private BUTPPacket send_pkt, recv_pkt;
     private short src_port, dst_port;
@@ -41,7 +41,7 @@ public class BUTPSocket {
     private double RTTm, RTTs, RTTd;
     private long RTO = 3000;
     private static final long RTO_TIMEOUT = 60000, CONNECTIONTIMEOUT = 180000;
-    private static final int MAXWINDOWSIZE = 11360, INITIALWINDOW = 2840;
+    private static final int MAXWINDOWSIZE = 65535, INITIALWINDOW = 2840;
     private byte flags, retransmission = 0;
     private long send_time, recv_time;
     private static final byte SYN_PSH = 0x00;
@@ -242,14 +242,18 @@ public class BUTPSocket {
         ByteBuffer buffer = ByteBuffer.wrap(send_data);
         sequence = 0;
         acknowledge = 0;
+        seq_ack = 0;
+        seq_tr = 0;
         flags = PSH;
-        cwnd = MAXWINDOWSIZE;
+        cwnd = INITIALWINDOW;
         slowstart = true;
         congestion = false;
         byte[] BUTP_segment;
         int sent = 0;
+        Future future = null;
         while (buffer.hasRemaining()) {
-            if (SEGMENT_SIZE > buffer.remaining()) {
+            if (sent <= cwnd) {
+                if (SEGMENT_SIZE > buffer.remaining()) {
                 BUTP_segment = new byte[buffer.remaining()];
                 sent = sent + buffer.remaining();
                 flags = PSH_FIN;
@@ -261,10 +265,9 @@ public class BUTPSocket {
             sequence = buffer.position();
             buffer.get(BUTP_segment);
             send(BUTP_segment, flags);
-            if (sent == cwnd) {
-                logger.log(Level.INFO, "Waiting for acknowledgement.");
-
-                Future future = service.submit(new Runnable() {
+            seq_tr = sequence;
+            if(flags != PSH_FIN){
+                future = service.submit(new Runnable() {
 
                     @Override
                     public void run() {
@@ -272,32 +275,41 @@ public class BUTPSocket {
                             receive(false);
                             calculate_RTO();
                             acknowledge = recv_pkt.getAcknowledgeNumber();
+                            if((acknowledge > seq_ack) && (acknowledge <= (seq_ack + cwnd))){
+                                seq_ack = acknowledge;
+                            }
                             logger.log(Level.INFO, "Acknowledgement received: {0}", new Object[]{acknowledge});
 
                         } catch (IOException ex) {
-                            Logger.getLogger(BUTPSocket.class.getName()).log(Level.SEVERE, "Socket error", ex);
+                            Logger.getLogger(BUTPSocket.class.getName()).log(Level.SEVERE, "Socket error: ", ex);
                         }
                     }
                 });
+                if(seq_ack == acknowledge){
+                    sent -= SEGMENT_SIZE;
+                    buffer.position(seq_ack);
+                }
+                
                 try {
                     future.get(RTO, TimeUnit.MILLISECONDS);
-                    /*if (retransmission == 0 && cwnd < MAXWINDOWSIZE && slowstart) {
+                    if ((retransmission == 0) && (cwnd < (MAXWINDOWSIZE  / 2)) && slowstart) {
                         cwnd *= 2;
 
-                    } else if (retransmission == 0 && cwnd < MAXWINDOWSIZE && congestion) {
-                        cwnd += (SEGMENT_SIZE * 10);
+                    } else if ((retransmission == 0) && (cwnd < (MAXWINDOWSIZE  - 14200)) && congestion) {
+                        cwnd += 14200;
                     } else if (retransmission == 3) {
                         slowstart = true;
                         congestion = false;
                         cwnd = INITIALWINDOW;
                     }
-                    retransmission = 0;*/
+                    retransmission = 0;
+                
                 } catch (InterruptedException ex) {
-                    Logger.getLogger(BUTPSocket.class.getName()).log(Level.SEVERE, "Interrupted", ex);
+                    Logger.getLogger(BUTPSocket.class.getName()).log(Level.SEVERE, null, ex);
                 } catch (ExecutionException ex) {
-                    Logger.getLogger(BUTPSocket.class.getName()).log(Level.SEVERE, "Execution failed.", ex);
-                } catch (TimeoutException ex) {
-                    Logger.getLogger(BUTPSocket.class.getName()).log(Level.SEVERE, "Connection timeout");
+                    Logger.getLogger(BUTPSocket.class.getName()).log(Level.SEVERE, null, ex);
+                }catch (TimeoutException ex) {
+                    Logger.getLogger(BUTPSocket.class.getName()).log(Level.SEVERE, "RTO expired");
                     future.cancel(true);
                     RTO = RTO * 2;
                     if (retransmission < 3) {
@@ -309,13 +321,15 @@ public class BUTPSocket {
                         close();
                         System.exit(1);
                     }
-                    int current = buffer.position();
-                    buffer.position(current - sent);
-                    sent = 0;
+                    buffer.position(seq_ack);
+                    sent -= SEGMENT_SIZE;
 
                 }
-
             }
+            }
+                
+
+            
 
         }
     }
@@ -350,6 +364,7 @@ public class BUTPSocket {
         buffer.clear();
         sequence = 0;
         acknowledge = 0;
+        rwnd = INITIALWINDOW;
         logger.log(Level.INFO, "Start receiving data..");
         int received = 0;
         while ((flags == PSH) || (flags != PSH_FIN)) {
@@ -371,37 +386,36 @@ public class BUTPSocket {
                 if (checksum == recv_pkt.getCheckSum()) {
                     sequence = recv_pkt.getSequenceNumber();
                     flags = recv_pkt.getFlags();
-                    rwnd = recv_pkt.getWindowSize();
                     logger.log(Level.INFO,
                             "Receiving seqence: {0}, Acknowledged:{1}, Flags: {2}",
                             new Object[]{sequence, acknowledge, flags});
-                    if ((flags == PSH || flags == PSH_FIN) && (sequence == acknowledge)) {
+                    if (sequence == acknowledge) {
                         BUTPSegment = recv_pkt.getBUTPPayload();
                         received = received + BUTPSegment.length;
                         buffer.position(sequence);
                         int length = BUTPSegment.length;
-                        if (buffer.remaining() < BUTPSegment.length) {
+                        if (flags == PSH_FIN) {
                             length = buffer.remaining();
                         }
                         buffer.put(BUTPSegment, 0, length);
                         acknowledge = buffer.position();
-                        logger.log(Level.INFO, "Received bytes: {0} bytes, window size:{1}", new Object[]{received, rwnd});
-                        if (received == rwnd) {
-                            send(acknowledge, ACK);
-                            logger.log(Level.INFO, "Sending acknowledge:- {0}", acknowledge);
-                            received = 0;
+                        logger.log(Level.INFO,
+                                "Received bytes: {0} bytes, window size:{1}", 
+                                new Object[]{received, rwnd});
+                       if (flags != PSH_FIN){
+                           logger.log(Level.INFO, "Sending acknowledge:- {0}", acknowledge);
+                           send(acknowledge, ACK);
                         }
+                     
                     } else {
                         logger.log(Level.INFO,
-                            "Dicarded : received: {0}, Acknowledged:{1}, Flags: {2}",
+                            "Discarded : received: {0}, Acknowledged:{1}, Flags: {2}",
                             new Object[]{sequence, acknowledge, flags});
-                        acknowledge = acknowledge - received;
-                        received = 0;
+                        send(acknowledge, ACK);
                     }
                 } else {
                     logger.log(Level.INFO, "Packet corrupted.");
-                    acknowledge = acknowledge - received;
-                    received = 0;
+                    send(acknowledge, ACK);
                 }
             } catch (InterruptedException ex) {
                 Logger.getLogger(BUTPSocket.class.getName()).log(Level.SEVERE, "Interrupted.", ex);
